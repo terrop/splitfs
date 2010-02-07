@@ -2,9 +2,12 @@
 #include <fuse.h>
 #include <fuse/fuse_lowlevel.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
+static bool one_to_many = true;
+static size_t total_bytes = 0;
 static const int PART_SIZE_BYTES = 100*1024*1024;
 
 static int full_fd = -1;
@@ -12,7 +15,7 @@ static struct filepart
 {
 	char *name;
 	size_t len;
-} parts[100];
+} parts[100] = {};
 
 /*
  * Look up a directory entry by name and get its attributes.
@@ -27,30 +30,51 @@ static struct filepart
  */
 void splitfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-	int i;
-
-	for (i = 0; parts[i].name; i++)
+	if (one_to_many)
 	{
-		if (strcmp(parts[i].name, name) == 0)
-		{
-			struct stat st =
-			{
-				.st_mode = S_IFREG | 0444,
-				.st_ino = (ino_t)&parts[i],
-				.st_size = parts[i].len,
-			};
-			struct fuse_entry_param ep =
-			{
-				.ino = (fuse_ino_t)&parts[i],
-				.generation = 1,
-				.attr = st,
-				.attr_timeout = 0.0,
-				.entry_timeout = 0.0,
-			};
+		int i;
 
-			fuse_reply_entry(req, &ep);
-			return;
+		for (i = 0; parts[i].name; i++)
+		{
+			if (strcmp(parts[i].name, name) == 0)
+			{
+				struct stat st =
+				{
+					.st_mode = S_IFREG | 0444,
+					.st_ino = (ino_t)&parts[i],
+					.st_size = parts[i].len,
+				};
+				struct fuse_entry_param ep =
+				{
+					.ino = (fuse_ino_t)&parts[i],
+					.generation = 1,
+					.attr = st,
+					.attr_timeout = 0.0,
+					.entry_timeout = 0.0,
+				};
+
+				fuse_reply_entry(req, &ep);
+				return;
+			}
 		}
+	} else {
+		struct stat st =
+		{
+			.st_mode = S_IFREG | 0444,
+			.st_ino = 2,
+			.st_size = total_bytes,
+		};
+		struct fuse_entry_param ep =
+		{
+			.ino = 2,
+			.generation = 1,
+			.attr = st,
+			.attr_timeout = 0.0,
+			.entry_timeout = 0.0,
+		};
+
+		fuse_reply_entry(req, &ep);
+		return;
 	}
 
 	fuse_reply_err(req, ENOENT);
@@ -77,6 +101,14 @@ void splitfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		};
 
 		fuse_reply_attr(req, &st, 0.0);
+	} else if (ino == 2) {
+		struct stat st =
+		{
+			.st_mode = S_IFREG | 0444,
+			.st_size = total_bytes,
+		};
+
+		fuse_reply_attr(req, &st, 0.0);
 	} else {
 		struct filepart *part = (struct filepart *)ino;
 		struct stat st =
@@ -85,15 +117,36 @@ void splitfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 			.st_size = part->len,
 
 		};
+
 		fuse_reply_attr(req, &st, 0.0);
 	}
+
 }
 
 void splitfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
 	int err = 0;
-
 	char *buf = malloc(size);
+
+	if (!one_to_many)
+	{
+		if (off == 0)
+		{
+			struct stat st =
+			{
+				.st_mode = S_IFREG,
+				.st_ino = 2,
+			};
+			fuse_add_direntry(req, buf, size, "full_file", &st, off+1);
+			fuse_reply_buf(req, buf,
+				fuse_dirent_size(strlen("full_file")));
+		} else {
+			fuse_reply_buf(req, NULL, 0);
+		}
+
+		return;
+	}
+
 	int pos = 0;
 
 	while (parts[off].name)
@@ -143,19 +196,24 @@ out_err:
 void splitfs_rename(fuse_req_t req, fuse_ino_t parent,
 	const char *name, fuse_ino_t newparent, const char *newname)
 {
-	int i;
-	for (i = 0; parts[i].name; i++)
+	if (one_to_many)
 	{
-		if (strcmp(parts[i].name, name) == 0)
+		int i;
+		for (i = 0; parts[i].name; i++)
 		{
-			free(parts[i].name);
-			parts[i].name = strdup(newname);
-			fuse_reply_err(req, 0);
-			return;
+			if (strcmp(parts[i].name, name) == 0)
+			{
+				free(parts[i].name);
+				parts[i].name = strdup(newname);
+				fuse_reply_err(req, 0);
+				return;
+			}
 		}
-	}
 
-	fuse_reply_err(req, ENOENT);
+		fuse_reply_err(req, ENOENT);
+	} else {
+		fuse_reply_err(req, EROFS);
+	}
 }
 
 /*
@@ -185,27 +243,85 @@ void splitfs_rename(fuse_req_t req, fuse_ino_t parent,
  */
 void splitfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
-	struct filepart *part = (struct filepart *)ino;
-	int i;
-	size_t offset = 0;
-	int ret;
-	char buf[size];
-
-	for (i = 0; parts[i].name; i++)
+	if (one_to_many)
 	{
-		if (part != &parts[i])
+		struct filepart *part = (struct filepart *)ino;
+		int i;
+		size_t offset = 0;
+		int ret;
+		char buf[size];
+
+		for (i = 0; parts[i].name; i++)
 		{
-			offset += parts[i].len;
-			continue;
+			if (part != &parts[i])
+			{
+				offset += parts[i].len;
+				continue;
+			}
+
+			offset += off;
+			ret = pread(full_fd, buf, size, offset);
+			if (ret < 0)
+				fuse_reply_err(req, errno);
+			else
+				fuse_reply_buf(req, buf, ret);
+			return;
+		}
+	} else {
+		int i;
+		char buf[size];
+		size_t total_read = 0;
+
+		for (i = 0; parts[i].name; i++)
+		{
+			if (off > parts[i].len)
+			{
+				off -= parts[i].len;
+				continue;
+			}
+
+			break;
 		}
 
-		offset += off;
-		ret = pread(full_fd, buf, size, offset);
-		if (ret < 0)
-			fuse_reply_err(req, errno);
-		else
-			fuse_reply_buf(req, buf, ret);
-		return;
+		if (!parts[i].name)
+		{
+			fuse_reply_err(req, ERANGE);
+			return;
+		}
+
+		while (size > 0 && parts[i].name)
+		{
+			int fd = open(parts[i].name, O_RDONLY);
+			if (fd < 0)
+				goto out;
+
+			int len = pread(fd, buf + total_read, size, off);
+			if (len < 0)
+			{
+				perror("pread");
+				goto out;
+			} else if (len == size) {
+				total_read += len;
+				close(fd);
+				goto out_ok;
+			} else {
+				i++;
+				off = 0;
+				size -= len;
+				total_read += len;
+				close(fd);
+				continue;
+			}
+		}
+
+		if (total_read > 0)
+		{
+out_ok:
+			fuse_reply_buf(req, buf, total_read);
+			return;
+		}
+out:
+		fuse_reply_err(req, EIO);
 	}
 }
 
@@ -244,7 +360,7 @@ struct fuse_lowlevel_ops splitfs_operations =
 
 int main(int argc, char *argv[])
 {
-	struct fuse_args args = FUSE_ARGS_INIT(argc - 1, argv + 1);
+	struct fuse_args args = FUSE_ARGS_INIT(2, argv + (argc - 2));
 	struct stat st;
 
 	char *mountpoint;
@@ -252,43 +368,71 @@ int main(int argc, char *argv[])
 	int err = -1;
 
 	int i = 0;
-	size_t total_bytes = 0;
 
-	full_fd = open(argv[1], O_RDONLY);
-	if (full_fd < 0)
-	{
-		perror("open");
+	if (argc == 3) {/*./oma file mnt/ */
+		one_to_many = true;
+	} else if (argc > 3) { /* ./oma file1 file2 ... mnt/ */
+		one_to_many = false;
+	} else {
+		printf("Usage: \t%s <file_to_split> <mount_point>\n"
+			"\t%s <part1> <part2> ... <mount_point\n",
+			argv[0], argv[0]);
 		return 1;
 	}
 
-	if (fstat(full_fd, &st) < 0)
+	if (one_to_many)
 	{
-		perror("fstat");
-		close(full_fd);
-		return 1;
-	}
-
-	while (--argc)
-		printf("%s\n", *++argv);
-
-	total_bytes = st.st_size;
-
-	while (total_bytes > 0)
-	{
-		char buf[128];
-		sprintf(buf, "part_%.3d", i + 1);
-		parts[i].name = strdup(buf);
-
-		if (total_bytes >= PART_SIZE_BYTES)
+		/* One to many */
+		full_fd = open(argv[1], O_RDONLY);
+		if (full_fd < 0)
 		{
-			parts[i].len = PART_SIZE_BYTES;
-			total_bytes -= PART_SIZE_BYTES;
-		} else {
-			parts[i].len = total_bytes;
-			total_bytes = 0;
+			perror("open");
+			return 1;
 		}
 
-		i++;
+		if (fstat(full_fd, &st) < 0)
+		{
+			perror("fstat");
+			close(full_fd);
+			return 1;
+		}
+
+		total_bytes = st.st_size;
+
+		while (total_bytes > 0)
+		{
+			char buf[128];
+			sprintf(buf, "part_%.3d", i + 1);
+			parts[i].name = strdup(buf);
+
+			if (total_bytes >= PART_SIZE_BYTES)
+			{
+				parts[i].len = PART_SIZE_BYTES;
+				total_bytes -= PART_SIZE_BYTES;
+			} else {
+				parts[i].len = total_bytes;
+				total_bytes = 0;
+			}
+
+			i++;
+		}
+	} else {
+		/* Many to one */
+		struct stat st;
+		int i = 0;
+		while (--argc > 1)
+		{
+			parts[i].name = strdup(canonicalize_file_name(*++argv));
+			if (stat(parts[i].name, &st) < 0)
+			{
+				perror("stat");
+				return 1;
+			}
+
+			parts[i].len = st.st_size;
+			total_bytes += st.st_size;
+			i++;
+		}
 	}
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, &foreground) != -1)
