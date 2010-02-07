@@ -84,6 +84,11 @@ class SplitFS(fuse.Fuse):
     def read(self, size, offset):
         return big.read(offset, size)
 
+    def lookup(self, path):
+        if path != "/bigfile":
+            return -errno.ENOENT
+        return self
+
 fuse.fuse_python_api = (0,2)
 
 server = SplitFS()
