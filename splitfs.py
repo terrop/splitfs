@@ -93,5 +93,5 @@ fuse.fuse_python_api = (0,2)
 
 server = SplitFS()
 server.parse()
-big = BigFile([File(filename) for filename in sys.argv[1:]])
+big = BigFile([File(filename) for filename in sys.argv[1:-1]])
 server.main()
