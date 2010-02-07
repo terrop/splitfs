@@ -9,6 +9,7 @@
 static bool one_to_many = true;
 static size_t total_bytes = 0;
 static const int PART_SIZE_BYTES = 100*1024*1024;
+static char *full_file_name;
 
 static int full_fd = -1;
 static struct filepart
@@ -57,7 +58,7 @@ void splitfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 				return;
 			}
 		}
-	} else {
+	} else if (strcmp(name, full_file_name) == 0) {
 		struct stat st =
 		{
 			.st_mode = S_IFREG | 0444,
@@ -137,9 +138,9 @@ void splitfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, str
 				.st_mode = S_IFREG,
 				.st_ino = 2,
 			};
-			fuse_add_direntry(req, buf, size, "full_file", &st, off+1);
+			fuse_add_direntry(req, buf, size, full_file_name, &st, off+1);
 			fuse_reply_buf(req, buf,
-				fuse_dirent_size(strlen("full_file")));
+				fuse_dirent_size(strlen(full_file_name)));
 		} else {
 			fuse_reply_buf(req, NULL, 0);
 		}
@@ -212,7 +213,9 @@ void splitfs_rename(fuse_req_t req, fuse_ino_t parent,
 
 		fuse_reply_err(req, ENOENT);
 	} else {
-		fuse_reply_err(req, EROFS);
+		free(full_file_name);
+		full_file_name = strdup(newname);
+		fuse_reply_err(req, 0);
 	}
 }
 
@@ -373,6 +376,7 @@ int main(int argc, char *argv[])
 		one_to_many = true;
 	} else if (argc > 3) { /* ./oma file1 file2 ... mnt/ */
 		one_to_many = false;
+		full_file_name = strdup("full_file");
 	} else {
 		printf("Usage: \t%s <file_to_split> <mount_point>\n"
 			"\t%s <part1> <part2> ... <mount_point\n",
