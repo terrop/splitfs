@@ -16,7 +16,8 @@ static struct filepart
 {
 	char *name;
 	size_t len;
-} parts[100] = {};
+	struct filepart *next;
+} *parts = NULL;
 
 /*
  * Look up a directory entry by name and get its attributes.
@@ -33,21 +34,21 @@ void splitfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	if (one_to_many)
 	{
-		int i;
+		struct filepart *part;
 
-		for (i = 0; parts[i].name; i++)
+		for (part = parts; part; part = part->next)
 		{
-			if (strcmp(parts[i].name, name) == 0)
+			if (strcmp(part->name, name) == 0)
 			{
 				struct stat st =
 				{
 					.st_mode = S_IFREG | 0444,
-					.st_ino = (ino_t)&parts[i],
-					.st_size = parts[i].len,
+					.st_ino = (ino_t)part,
+					.st_size = part->len,
 				};
 				struct fuse_entry_param ep =
 				{
-					.ino = (fuse_ino_t)&parts[i],
+					.ino = (fuse_ino_t)part,
 					.generation = 1,
 					.attr = st,
 					.attr_timeout = 0.0,
@@ -126,6 +127,10 @@ void splitfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
 void splitfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
+	static struct filepart *part;
+	if (off == 0)
+		part = parts;
+
 	int err = 0;
 	char *buf = malloc(size);
 
@@ -150,21 +155,21 @@ void splitfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, str
 
 	int pos = 0;
 
-	while (parts[off].name)
+	while (part)
 	{
 		struct stat st =
 		{
 			.st_mode = S_IFREG,
-			.st_ino = (ino_t)&parts[off],
+			.st_ino = (ino_t)part,
 		};
 
-		int len = fuse_dirent_size(strlen(parts[off].name));
+		int len = fuse_dirent_size(strlen(part->name));
 		if (pos + len > size)
 			break;
 
-		fuse_add_direntry(req, buf + pos, size - pos, parts[off].name, &st, off+1);
-		off++;
+		fuse_add_direntry(req, buf + pos, size - pos, part->name, &st, ++off);
 		pos += len;
+		part = part->next;
 	}
 
 	if (pos)
@@ -199,13 +204,14 @@ void splitfs_rename(fuse_req_t req, fuse_ino_t parent,
 {
 	if (one_to_many)
 	{
-		int i;
-		for (i = 0; parts[i].name; i++)
+		struct filepart *part;
+
+		for (part = parts; part; part = part->next)
 		{
-			if (strcmp(parts[i].name, name) == 0)
+			if (strcmp(part->name, name) == 0)
 			{
-				free(parts[i].name);
-				parts[i].name = strdup(newname);
+				free(part->name);
+				part->name = strdup(newname);
 				fuse_reply_err(req, 0);
 				return;
 			}
@@ -248,17 +254,18 @@ void splitfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct
 {
 	if (one_to_many)
 	{
+		struct filepart *tmp;
 		struct filepart *part = (struct filepart *)ino;
 		int i;
 		size_t offset = 0;
 		int ret;
 		char buf[size];
 
-		for (i = 0; parts[i].name; i++)
+		for (tmp = parts; tmp; tmp = tmp->next)
 		{
-			if (part != &parts[i])
+			if (tmp != part)
 			{
-				offset += parts[i].len;
+				offset += tmp->len;
 				continue;
 			}
 
@@ -274,27 +281,28 @@ void splitfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct
 		int i;
 		char buf[size];
 		size_t total_read = 0;
+		struct filepart *part;
 
-		for (i = 0; parts[i].name; i++)
+		for (part = parts; part; part = part->next)
 		{
-			if (off > parts[i].len)
+			if (off > part->len)
 			{
-				off -= parts[i].len;
+				off -= part->len;
 				continue;
 			}
 
 			break;
 		}
 
-		if (!parts[i].name)
+		if (!part)
 		{
 			fuse_reply_err(req, ERANGE);
 			return;
 		}
 
-		while (size > 0 && parts[i].name)
+		while (size > 0 && part)
 		{
-			int fd = open(parts[i].name, O_RDONLY);
+			int fd = open(part->name, O_RDONLY);
 			if (fd < 0)
 				goto out;
 
@@ -308,7 +316,7 @@ void splitfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct
 				close(fd);
 				goto out_ok;
 			} else {
-				i++;
+				part = part->next;
 				off = 0;
 				size -= len;
 				total_read += len;
@@ -405,20 +413,33 @@ int main(int argc, char *argv[])
 
 		while (total_bytes > 0)
 		{
+			struct filepart *tmp;
+			struct filepart *part = malloc(sizeof(*part));
 			char buf[128];
 			sprintf(buf, "part_%.3d", i + 1);
-			parts[i].name = strdup(buf);
+			part->name = strdup(buf);
 
 			if (total_bytes >= PART_SIZE_BYTES)
 			{
-				parts[i].len = PART_SIZE_BYTES;
+				part->len = PART_SIZE_BYTES;
 				total_bytes -= PART_SIZE_BYTES;
 			} else {
-				parts[i].len = total_bytes;
+				part->len = total_bytes;
 				total_bytes = 0;
 			}
 
 			i++;
+			part->next = NULL;
+
+			if (parts)
+			{
+				struct filepart *tmp = parts;
+				while (tmp->next)
+					tmp = tmp->next;
+				tmp->next = part;
+			} else {
+				parts = part;
+			}
 		}
 	} else {
 		/* Many to one */
@@ -426,16 +447,28 @@ int main(int argc, char *argv[])
 		int i = 0;
 		while (--argc > 1)
 		{
-			parts[i].name = strdup(canonicalize_file_name(*++argv));
-			if (stat(parts[i].name, &st) < 0)
+			struct filepart *part = malloc(sizeof(*part));
+			part->name = strdup(canonicalize_file_name(*++argv));
+			if (stat(part->name, &st) < 0)
 			{
 				perror("stat");
 				return 1;
 			}
 
-			parts[i].len = st.st_size;
+			part->len = st.st_size;
 			total_bytes += st.st_size;
 			i++;
+
+			part->next = NULL;
+			if (parts)
+			{
+				struct filepart *tmp = parts;
+				while (tmp->next)
+					tmp = tmp->next;
+				tmp->next = part;
+			} else {
+				parts = part;
+			}
 		}
 	}
 
