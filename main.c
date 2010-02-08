@@ -95,34 +95,20 @@ void splitfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
  */
 void splitfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+	struct stat st = {};
+
 	if (ino == FUSE_ROOT_ID)
 	{
-		struct stat st =
-		{
-			.st_mode = S_IFDIR,
-		};
-
-		fuse_reply_attr(req, &st, 0.0);
+		st.st_mode = S_IFDIR | 0555;
 	} else if (ino == 2) {
-		struct stat st =
-		{
-			.st_mode = S_IFREG | 0444,
-			.st_size = total_bytes,
-		};
-
-		fuse_reply_attr(req, &st, 0.0);
+		st.st_mode = S_IFREG | 0444;
+		st.st_size = total_bytes;
 	} else {
-		struct filepart *part = (struct filepart *)ino;
-		struct stat st =
-		{
-			.st_mode = S_IFREG | 0444,
-			.st_size = part->len,
-
-		};
-
-		fuse_reply_attr(req, &st, 0.0);
+		st.st_mode = S_IFREG | 0444;
+		st.st_size = ((struct filepart *)ino)->len;
 	}
 
+	fuse_reply_attr(req, &st, 0.0);
 }
 
 void splitfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
